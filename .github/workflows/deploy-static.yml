@@ -1,6 +1,11 @@
 # Ablage: Repo "reinstil/deploy-workflows" (öffentlich)  →  .github/workflows/deploy-static.yml
-# Wiederverwendbarer Workflow für ALLE statischen Kundenseiten.
+# Wiederverwendbarer Workflow für ALLE Kundenseiten (reines HTML oder Astro/Vite & Co.).
 # Enthält keine Zugangsdaten – die kommen als Secrets aus dem jeweiligen Kunden-Repo.
+#
+# Build wird automatisch erkannt:
+#   package.json mit "build"-Script → npm ci + npm run build, Upload von dist/
+#   sonst                           → kein Build, Upload des Repo-Inhalts
+#   (build_command / output_dir in deploy.yml überschreiben die Erkennung, falls nötig)
 #
 # staging    → ~/<STAGING_PATH>/              wenn Repo-Variable STAGING_PATH gesetzt ist
 #              sonst ~/staging/sites/<repo>/  (= <repo>.<staging_domain>)
@@ -31,14 +36,14 @@ on:
         required: false
         type: string
         default: ""
-      build_command:      # leer bei reinem HTML/CSS ohne Build
+      build_command:      # "auto" = erkennen; "" = kein Build; sonst eigener Befehl
         required: false
         type: string
-        default: ""
-      output_dir:         # z. B. "dist", "build", "public" oder "."
+        default: "auto"
+      output_dir:         # "auto" = dist/ bei Build, sonst Repo-Root; sonst eigener Ordner
         required: false
         type: string
-        default: "."
+        default: "auto"
       node_version:
         required: false
         type: string
@@ -60,18 +65,65 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Projekt erkennen
+        id: detect
+        env:
+          IN_BUILD: ${{ inputs.build_command }}
+          IN_OUT: ${{ inputs.output_dir }}
+        run: |
+          HAS_BUILD_SCRIPT=false
+          if [ -f package.json ] && node -e "process.exit(require('./package.json').scripts?.build ? 0 : 1)"; then
+            HAS_BUILD_SCRIPT=true
+          fi
+
+          if [ "$IN_BUILD" = "auto" ]; then
+            if [ "$HAS_BUILD_SCRIPT" = true ]; then BUILD="npm run build"; else BUILD=""; fi
+          else
+            BUILD="$IN_BUILD"
+          fi
+
+          if [ "$IN_OUT" = "auto" ]; then
+            if [ -n "$BUILD" ]; then OUT="dist"; else OUT="."; fi
+          else
+            OUT="$IN_OUT"
+          fi
+
+          LOCK=false
+          [ -f package-lock.json ] && LOCK=true
+
+          echo "build=$BUILD" >> "$GITHUB_OUTPUT"
+          echo "out=$OUT"     >> "$GITHUB_OUTPUT"
+          echo "lock=$LOCK"   >> "$GITHUB_OUTPUT"
+          if [ -n "$BUILD" ]; then
+            echo "::notice::Build erkannt: '$BUILD' → Upload aus '$OUT/'"
+          else
+            echo "::notice::Kein Build – Upload des Repo-Inhalts"
+          fi
+
       - name: Node einrichten
-        if: inputs.build_command != ''
+        if: steps.detect.outputs.build != ''
         uses: actions/setup-node@v5
         with:
           node-version: ${{ inputs.node_version }}
-          cache: npm
+          cache: ${{ steps.detect.outputs.lock == 'true' && 'npm' || '' }}
 
       - name: Build
-        if: inputs.build_command != ''
+        if: steps.detect.outputs.build != ''
+        env:
+          BUILD: ${{ steps.detect.outputs.build }}
+          OUT: ${{ steps.detect.outputs.out }}
         run: |
-          npm ci
-          ${{ inputs.build_command }}
+          if [ "${{ steps.detect.outputs.lock }}" = "true" ]; then
+            npm ci
+          else
+            echo "::warning::Keine package-lock.json im Repo – nutze npm install. Bitte Lockfile committen."
+            npm install
+          fi
+          $BUILD
+          if [ ! -d "$OUT" ]; then
+            echo "::error::Build lief durch, aber der Ordner '$OUT' fehlt. output_dir in deploy.yml setzen."
+            exit 1
+          fi
 
       - name: Zielpfad bestimmen
         id: target
@@ -120,13 +172,19 @@ jobs:
 
       - name: Upload per rsync
         if: steps.target.outputs.skip != 'true'
+        env:
+          OUT: ${{ steps.detect.outputs.out }}
         run: |
+          # Quellcode-Dateien nie hochladen, falls ohne Build aus dem Repo-Root deployt wird
           # P = auf dem Server vor dem Löschen schützen (Passwortschutz, SSL-Validierung)
           rsync -az --delete \
             --exclude='.git*' \
             --exclude='node_modules' \
+            --exclude='CLAUDE.md' \
+            --exclude='.claude' \
+            --exclude='README.md' \
             --filter='P .htaccess' \
             --filter='P .well-known' \
             -e "ssh -p ${SSH_PORT} -i ~/.ssh/id_ed25519" \
-            "${{ inputs.output_dir }}/" \
+            "${OUT}/" \
             "${SSH_USER}@${SSH_HOST}:${{ steps.target.outputs.path }}/"
