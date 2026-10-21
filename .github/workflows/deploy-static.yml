@@ -1,0 +1,132 @@
+# Ablage: Repo "reinstil/deploy-workflows" (öffentlich)  →  .github/workflows/deploy-static.yml
+# Wiederverwendbarer Workflow für ALLE statischen Kundenseiten.
+# Enthält keine Zugangsdaten – die kommen als Secrets aus dem jeweiligen Kunden-Repo.
+#
+# staging    → ~/<STAGING_PATH>/              wenn Repo-Variable STAGING_PATH gesetzt ist
+#              sonst ~/staging/sites/<repo>/  (= <repo>.<staging_domain>)
+# production → ~/<PROD_PATH>/                 Repo-Variable, z. B. "kunde-a.de"
+#              ohne PROD_PATH wird Production übersprungen
+
+name: Deploy static site
+
+on:
+  workflow_call:
+    inputs:
+      environment:        # "staging" oder "production"
+        required: true
+        type: string
+      ssh_host:           # leer = Org-/Repo-Variable SSH_HOST
+        required: false
+        type: string
+        default: ""
+      ssh_user:           # leer = Org-/Repo-Variable SSH_USER
+        required: false
+        type: string
+        default: ""
+      ssh_port:
+        required: false
+        type: string
+        default: "1988"
+      staging_domain:     # nur für die zentrale Wildcard-Staging-Domain
+        required: false
+        type: string
+        default: ""
+      build_command:      # leer bei reinem HTML/CSS ohne Build
+        required: false
+        type: string
+        default: ""
+      output_dir:         # z. B. "dist", "build", "public" oder "."
+        required: false
+        type: string
+        default: "."
+      node_version:
+        required: false
+        type: string
+        default: "20"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    concurrency:
+      group: deploy-${{ github.repository }}-${{ inputs.environment }}
+      cancel-in-progress: true
+    env:
+      SSH_HOST: ${{ inputs.ssh_host || vars.SSH_HOST }}
+      SSH_USER: ${{ inputs.ssh_user || vars.SSH_USER }}
+      SSH_PORT: ${{ inputs.ssh_port || vars.SSH_PORT }}
+      STAGING_DOMAIN: ${{ inputs.staging_domain || vars.STAGING_DOMAIN }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Node einrichten
+        if: inputs.build_command != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: npm
+
+      - name: Build
+        if: inputs.build_command != ''
+        run: |
+          npm ci
+          ${{ inputs.build_command }}
+
+      - name: Zielpfad bestimmen
+        id: target
+        run: |
+          if [ "${{ inputs.environment }}" = "production" ]; then
+            if [ -z "${{ vars.PROD_PATH }}" ]; then
+              echo "::notice::PROD_PATH ist nicht gesetzt – Production-Deploy übersprungen."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "path=${{ vars.PROD_PATH }}" >> "$GITHUB_OUTPUT"
+            echo "::notice::Production-Ziel: ~/${{ vars.PROD_PATH }}"
+          else
+            if [ -n "${{ vars.STAGING_PATH }}" ]; then
+              echo "path=${{ vars.STAGING_PATH }}" >> "$GITHUB_OUTPUT"
+              echo "::notice::Staging-Ziel: ~/${{ vars.STAGING_PATH }}"
+            else
+              # Repo-Name → gültige Subdomain (klein, nur a-z 0-9 -)
+              NAME=$(echo "${{ github.event.repository.name }}" | tr '[:upper:]_.' '[:lower:]--')
+              echo "path=staging/sites/${NAME}" >> "$GITHUB_OUTPUT"
+              echo "::notice::Staging-URL: https://${NAME}.${STAGING_DOMAIN}"
+            fi
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Konfiguration prüfen
+        if: steps.target.outputs.skip != 'true'
+        env:
+          HAS_KEY: ${{ secrets.SSH_PRIVATE_KEY != '' }}
+          HAS_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS != '' }}
+        run: |
+          ok=true
+          [ -z "$SSH_HOST" ] && echo "::error::ssh_host fehlt (deploy.yml oder Variable SSH_HOST)" && ok=false
+          [ -z "$SSH_USER" ] && echo "::error::ssh_user fehlt (deploy.yml oder Variable SSH_USER)" && ok=false
+          [ "$HAS_KEY" != "true" ] && echo "::error::Secret SSH_PRIVATE_KEY fehlt im Repo" && ok=false
+          [ "$HAS_HOSTS" != "true" ] && echo "::error::Secret SSH_KNOWN_HOSTS fehlt im Repo" && ok=false
+          [ "$ok" = true ]
+
+      - name: SSH einrichten
+        if: steps.target.outputs.skip != 'true'
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          echo "${{ secrets.SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+
+      - name: Upload per rsync
+        if: steps.target.outputs.skip != 'true'
+        run: |
+          # P = auf dem Server vor dem Löschen schützen (Passwortschutz, SSL-Validierung)
+          rsync -az --delete \
+            --exclude='.git*' \
+            --exclude='node_modules' \
+            --filter='P .htaccess' \
+            --filter='P .well-known' \
+            -e "ssh -p ${SSH_PORT} -i ~/.ssh/id_ed25519" \
+            "${{ inputs.output_dir }}/" \
+            "${SSH_USER}@${SSH_HOST}:${{ steps.target.outputs.path }}/"
