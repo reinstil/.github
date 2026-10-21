@@ -58,11 +58,11 @@ jobs:
       STAGING_DOMAIN: ${{ inputs.staging_domain || vars.STAGING_DOMAIN }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Node einrichten
         if: inputs.build_command != ''
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: ${{ inputs.node_version }}
           cache: npm
