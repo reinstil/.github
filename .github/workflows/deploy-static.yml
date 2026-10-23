@@ -1,16 +1,28 @@
 # Ablage: Repo "reinstil/deploy-workflows" (öffentlich)  →  .github/workflows/deploy-static.yml
 # Wiederverwendbarer Workflow für ALLE Kundenseiten (reines HTML oder Astro/Vite & Co.).
-# Enthält keine Zugangsdaten – die kommen als Secrets aus dem jeweiligen Kunden-Repo.
+# Enthält keine Zugangsdaten – die kommen als Secrets/Variablen aus dem jeweiligen Kunden-Repo bzw. der Org.
 #
 # Build wird automatisch erkannt:
 #   package.json mit "build"-Script → npm ci + npm run build, Upload von dist/
 #   sonst                           → kein Build, Upload des Repo-Inhalts
 #   (build_command / output_dir in deploy.yml überschreiben die Erkennung, falls nötig)
 #
-# staging    → ~/<STAGING_PATH>/              wenn Repo-Variable STAGING_PATH gesetzt ist
-#              sonst ~/staging/sites/<repo>/  (= <repo>.<staging_domain>)
-# production → ~/<PROD_PATH>/                 Repo-Variable, z. B. "kunde-a.de"
-#              ohne PROD_PATH wird Production übersprungen
+# Zugänge – Staging und Production haben getrennte cPanel-Konten und SSH-Schlüssel:
+#
+#   staging    Konto:   Variable STAGING_SSH_USER   (angelegt von reinstil/projekt-anlage)
+#              Schlüssel: Secret STAGING_SSH_PRIVATE_KEY
+#              Ziel:    ~/<STAGING_PATH>/, Standard public_html
+#              URL:     Variable STAGING_URL (nur für die Anzeige im Run)
+#
+#   production Konto:   Variable PROD_SSH_USER      (erst beim Go-live setzen)
+#              Schlüssel: Secret PROD_SSH_PRIVATE_KEY
+#              Ziel:    ~/<PROD_PATH>/; ohne PROD_PATH wird Production übersprungen
+#
+#   Alte Einrichtung (vor den Staging-Konten) funktioniert weiter: Fehlen die obigen Angaben,
+#   gelten ssh_user aus deploy.yml bzw. Variable SSH_USER, Secret SSH_PRIVATE_KEY und
+#   für Staging die Variable STAGING_PATH.
+#
+#   Für alle: Server SSH_HOST/SSH_PORT (Input oder Variable) und Secret SSH_KNOWN_HOSTS.
 
 name: Deploy static site
 
@@ -24,15 +36,11 @@ on:
         required: false
         type: string
         default: ""
-      ssh_user:           # leer = Org-/Repo-Variable SSH_USER
+      ssh_user:           # nur alte Einrichtung: leer = Variable SSH_USER
         required: false
         type: string
         default: ""
-      ssh_port:
-        required: false
-        type: string
-        default: "1988"
-      staging_domain:     # nur für die zentrale Wildcard-Staging-Domain
+      ssh_port:           # leer = Org-/Repo-Variable SSH_PORT, sonst 1988
         required: false
         type: string
         default: ""
@@ -44,10 +52,10 @@ on:
         required: false
         type: string
         default: "auto"
-      node_version:
+      node_version:       # Astro 7.4 braucht mindestens 22.23.4
         required: false
         type: string
-        default: "22"
+        default: "24"
 
 jobs:
   deploy:
@@ -58,9 +66,9 @@ jobs:
       cancel-in-progress: true
     env:
       SSH_HOST: ${{ inputs.ssh_host || vars.SSH_HOST }}
-      SSH_USER: ${{ inputs.ssh_user || vars.SSH_USER }}
-      SSH_PORT: ${{ inputs.ssh_port || vars.SSH_PORT }}
-      STAGING_DOMAIN: ${{ inputs.staging_domain || vars.STAGING_DOMAIN }}
+      SSH_PORT: ${{ inputs.ssh_port || vars.SSH_PORT || '1988' }}
+      # Konto je Umgebung; neue Variablen haben Vorrang vor der alten Einrichtung
+      SSH_USER: ${{ inputs.environment == 'production' && (vars.PROD_SSH_USER || inputs.ssh_user || vars.SSH_USER) || (vars.STAGING_SSH_USER || inputs.ssh_user || vars.SSH_USER) }}
 
     steps:
       - uses: actions/checkout@v5
@@ -127,53 +135,69 @@ jobs:
 
       - name: Zielpfad bestimmen
         id: target
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          PROD_PATH: ${{ vars.PROD_PATH }}
+          STAGING_PATH: ${{ vars.STAGING_PATH }}
+          STAGING_SSH_USER: ${{ vars.STAGING_SSH_USER }}
+          STAGING_URL: ${{ vars.STAGING_URL }}
         run: |
-          if [ "${{ inputs.environment }}" = "production" ]; then
-            if [ -z "${{ vars.PROD_PATH }}" ]; then
+          if [ "$ENVIRONMENT" = "production" ]; then
+            if [ -z "$PROD_PATH" ]; then
               echo "::notice::PROD_PATH ist nicht gesetzt – Production-Deploy übersprungen."
               echo "skip=true" >> "$GITHUB_OUTPUT"
               exit 0
             fi
-            echo "path=${{ vars.PROD_PATH }}" >> "$GITHUB_OUTPUT"
-            echo "::notice::Production-Ziel: ~/${{ vars.PROD_PATH }}"
+            ZIEL="$PROD_PATH"
+            echo "::notice::Production-Ziel: ${SSH_USER}:~/${ZIEL}"
           else
-            if [ -n "${{ vars.STAGING_PATH }}" ]; then
-              echo "path=${{ vars.STAGING_PATH }}" >> "$GITHUB_OUTPUT"
-              echo "::notice::Staging-Ziel: ~/${{ vars.STAGING_PATH }}"
+            if [ -n "$STAGING_PATH" ]; then
+              ZIEL="$STAGING_PATH"
+            elif [ -n "$STAGING_SSH_USER" ]; then
+              ZIEL="public_html"
             else
-              # Repo-Name → gültige Subdomain (klein, nur a-z 0-9 -)
-              NAME=$(echo "${{ github.event.repository.name }}" | tr '[:upper:]_.' '[:lower:]--')
-              echo "path=staging/sites/${NAME}" >> "$GITHUB_OUTPUT"
-              echo "::notice::Staging-URL: https://${NAME}.${STAGING_DOMAIN}"
+              echo "::error::Kein Staging-Ziel: Variable STAGING_SSH_USER (Staging-Konto) oder STAGING_PATH fehlt. Projekt mit reinstil/projekt-anlage einrichten."
+              exit 1
             fi
+            echo "::notice::Staging-Ziel: ${SSH_USER}:~/${ZIEL}"
+            [ -n "$STAGING_URL" ] && echo "::notice::Staging-URL: ${STAGING_URL}"
           fi
+          # Schutz vor leeren oder absoluten Pfaden, rsync --delete würde sonst zu viel löschen
+          case "$ZIEL" in
+            ""|/*|*..*) echo "::error::Ungültiger Zielpfad '$ZIEL'"; exit 1 ;;
+          esac
+          echo "path=$ZIEL" >> "$GITHUB_OUTPUT"
           echo "skip=false" >> "$GITHUB_OUTPUT"
 
       - name: Konfiguration prüfen
         if: steps.target.outputs.skip != 'true'
         env:
-          HAS_KEY: ${{ secrets.SSH_PRIVATE_KEY != '' }}
+          HAS_KEY: ${{ (inputs.environment == 'production' && (secrets.PROD_SSH_PRIVATE_KEY || secrets.SSH_PRIVATE_KEY) || (secrets.STAGING_SSH_PRIVATE_KEY || secrets.SSH_PRIVATE_KEY)) != '' }}
           HAS_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS != '' }}
         run: |
           ok=true
-          [ -z "$SSH_HOST" ] && echo "::error::ssh_host fehlt (deploy.yml oder Variable SSH_HOST)" && ok=false
-          [ -z "$SSH_USER" ] && echo "::error::ssh_user fehlt (deploy.yml oder Variable SSH_USER)" && ok=false
-          [ "$HAS_KEY" != "true" ] && echo "::error::Secret SSH_PRIVATE_KEY fehlt im Repo" && ok=false
-          [ "$HAS_HOSTS" != "true" ] && echo "::error::Secret SSH_KNOWN_HOSTS fehlt im Repo" && ok=false
+          [ -z "$SSH_HOST" ] && echo "::error::SSH_HOST fehlt (deploy.yml oder Variable SSH_HOST)" && ok=false
+          [ -z "$SSH_USER" ] && echo "::error::SSH-Benutzer fehlt (STAGING_SSH_USER / PROD_SSH_USER bzw. ssh_user)" && ok=false
+          [ "$HAS_KEY" != "true" ] && echo "::error::SSH-Schlüssel fehlt (Secret STAGING_SSH_PRIVATE_KEY / PROD_SSH_PRIVATE_KEY bzw. SSH_PRIVATE_KEY)" && ok=false
+          [ "$HAS_HOSTS" != "true" ] && echo "::error::Secret SSH_KNOWN_HOSTS fehlt (Repo oder Org)" && ok=false
           [ "$ok" = true ]
 
       - name: SSH einrichten
         if: steps.target.outputs.skip != 'true'
+        env:
+          SSH_KEY: ${{ inputs.environment == 'production' && (secrets.PROD_SSH_PRIVATE_KEY || secrets.SSH_PRIVATE_KEY) || (secrets.STAGING_SSH_PRIVATE_KEY || secrets.SSH_PRIVATE_KEY) }}
+          KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
         run: |
           mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          echo "${{ secrets.SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
 
       - name: Upload per rsync
         if: steps.target.outputs.skip != 'true'
         env:
           OUT: ${{ steps.detect.outputs.out }}
+          ZIEL: ${{ steps.target.outputs.path }}
         run: |
           # Quellcode-Dateien nie hochladen, falls ohne Build aus dem Repo-Root deployt wird
           # P = auf dem Server vor dem Löschen schützen (Passwortschutz, SSL-Validierung)
@@ -187,4 +211,4 @@ jobs:
             --filter='P .well-known' \
             -e "ssh -p ${SSH_PORT} -i ~/.ssh/id_ed25519" \
             "${OUT}/" \
-            "${SSH_USER}@${SSH_HOST}:${{ steps.target.outputs.path }}/"
+            "${SSH_USER}@${SSH_HOST}:${ZIEL}/"
